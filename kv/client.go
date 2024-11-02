@@ -28,16 +28,6 @@ func MakeKv(shardMap *ShardMap, clientPool ClientPool) *Kv {
 	return kv
 }
 
-func getNodesForKey(key string, shardMap *ShardMap) []string {
-	// calculate the appropriate shard
-	shard := GetShardForKey(key, shardMap.NumShards())
-
-	// Use the provided `ShardMap` instance in `Kv.shardMap` to find the set of nodes which host the shard.
-	nodeNames := shardMap.NodesForShard(shard)
-
-	return nodeNames
-}
-
 func (kv *Kv) Get(ctx context.Context, key string) (string, bool, error) {
 	// Trace-level logging -- you can remove or use to help debug in your tests
 	// with `-log-level=trace`. See the logging section of the spec.
@@ -46,7 +36,7 @@ func (kv *Kv) Get(ctx context.Context, key string) (string, bool, error) {
 	).Trace("client sending Get() request")
 
 	// find the nodes which host the key in the request
-	nodeNames := getNodesForKey(key, kv.shardMap)
+	nodeNames := GetNodesForKey(key, kv.shardMap)
 
 	// If no nodes are available (none host the shard), return an error.
 	if len(nodeNames) == 0 {
