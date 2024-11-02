@@ -17,7 +17,7 @@ type kvEntry struct {
 	expiry time.Time // Expiry timestamp based on TTL
 }
 
-const numShards = 16 // Define a reasonable number of shards (16 is a typical choice)
+const numStripes = 16 // Define a reasonable number of stripes (16 is a typical choice)
 
 type KvServerImpl struct {
 	proto.UnimplementedKvServer
@@ -28,8 +28,8 @@ type KvServerImpl struct {
 	clientPool ClientPool
 	shutdown   chan struct{}
 
-	shards []map[string]kvEntry // Data is partitioned across multiple maps
-	locks  []sync.RWMutex       // Each shard has its own RWMutex
+	stripes []map[string]kvEntry // Data is partitioned across multiple maps
+	locks   []sync.RWMutex       // Each shard has its own RWMutex
 }
 
 func (server *KvServerImpl) handleShardMapUpdate() {
@@ -56,13 +56,13 @@ func MakeKvServer(nodeName string, shardMap *ShardMap, clientPool ClientPool) *K
 		listener:   &listener,
 		clientPool: clientPool,
 		shutdown:   make(chan struct{}),
-		shards:     make([]map[string]kvEntry, numShards),
-		locks:      make([]sync.RWMutex, numShards),
+		stripes:    make([]map[string]kvEntry, numStripes),
+		locks:      make([]sync.RWMutex, numStripes),
 	}
 
 	// Initialize each shard as an empty map
-	for i := 0; i < numShards; i++ {
-		server.shards[i] = make(map[string]kvEntry)
+	for i := 0; i < numStripes; i++ {
+		server.stripes[i] = make(map[string]kvEntry)
 	}
 
 	go server.shardMapListenLoop()
@@ -88,15 +88,23 @@ func (server *KvServerImpl) Get(ctx context.Context, request *proto.GetRequest) 
 		return nil, status.Error(codes.InvalidArgument, "Key cannot be empty")
 	}
 
+	// Get the nodes responsible for the key's shard
+	nodes := GetNodesForKey(request.GetKey(), server.shardMap)
+
+	// Check if this server hosts the shard
+	if !contains(nodes, server.nodeName) {
+		return nil, status.Error(codes.NotFound, "Server does not host shard for this key")
+	}
+
 	// Determine the shard for this key
-	shardIndex := GetShardForKey(request.GetKey(), numShards) - 1
+	stripeIndex := GetShardForKey(request.GetKey(), numStripes) - 1
 
 	// Lock the specific shard for reading
-	server.locks[shardIndex].RLock()
-	defer server.locks[shardIndex].RUnlock()
+	server.locks[stripeIndex].RLock()
+	defer server.locks[stripeIndex].RUnlock()
 
 	// Look up the entry in the correct shard
-	entry, found := server.shards[shardIndex][request.GetKey()]
+	entry, found := server.stripes[stripeIndex][request.GetKey()]
 	if !found || time.Now().After(entry.expiry) {
 		// Either key does not exist or is expired
 		return &proto.GetResponse{
@@ -122,18 +130,25 @@ func (server *KvServerImpl) Set(ctx context.Context, request *proto.SetRequest) 
 		return nil, status.Error(codes.InvalidArgument, "Key cannot be empty")
 	}
 
+	// Get the nodes responsible for the key's shard
+	nodes := GetNodesForKey(request.GetKey(), server.shardMap)
+
+	if !contains(nodes, server.nodeName) {
+		return nil, status.Error(codes.NotFound, "Server does not host shard for this key")
+	}
+
 	// Calculate the expiry time based on TTL (in milliseconds).
 	expiry := time.Now().Add(time.Duration(request.GetTtlMs()) * time.Millisecond)
 
 	// Determine the shard for this key
-	shardIndex := GetShardForKey(request.GetKey(), numShards) - 1
+	stripeIndex := GetShardForKey(request.GetKey(), numStripes) - 1
 
 	// Lock the specific shard for writing
-	server.locks[shardIndex].Lock()
-	defer server.locks[shardIndex].Unlock()
+	server.locks[stripeIndex].Lock()
+	defer server.locks[stripeIndex].Unlock()
 
 	// Set the key-value pair in the correct shard
-	server.shards[shardIndex][request.GetKey()] = kvEntry{
+	server.stripes[stripeIndex][request.GetKey()] = kvEntry{
 		value:  request.Value,
 		expiry: expiry,
 	}
@@ -152,14 +167,22 @@ func (server *KvServerImpl) Delete(ctx context.Context, request *proto.DeleteReq
 		return nil, status.Error(codes.InvalidArgument, "Key cannot be empty")
 	}
 
-	shardIndex := GetShardForKey(request.GetKey(), numShards) - 1
+	// Get the nodes responsible for the key's shard
+	nodes := GetNodesForKey(request.GetKey(), server.shardMap)
+
+	// Check if this server hosts the shard
+	if !contains(nodes, server.nodeName) {
+		return nil, status.Error(codes.NotFound, "Server does not host shard for this key")
+	}
+
+	stripeIndex := GetShardForKey(request.GetKey(), numStripes) - 1
 
 	// Lock the specific shard for writing
-	server.locks[shardIndex].Lock()
-	defer server.locks[shardIndex].Unlock()
+	server.locks[stripeIndex].Lock()
+	defer server.locks[stripeIndex].Unlock()
 
 	// Delete the entry from the correct shard
-	delete(server.shards[shardIndex], request.GetKey())
+	delete(server.stripes[stripeIndex], request.GetKey())
 
 	// Return an empty DeleteResponse on success
 	return &proto.DeleteResponse{}, nil
@@ -170,4 +193,13 @@ func (server *KvServerImpl) GetShardContents(
 	request *proto.GetShardContentsRequest,
 ) (*proto.GetShardContentsResponse, error) {
 	panic("TODO: Part C")
+}
+
+func contains(nodes []string, nodeName string) bool {
+	for _, node := range nodes {
+		if node == nodeName {
+			return true
+		}
+	}
+	return false
 }
