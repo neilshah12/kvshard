@@ -65,6 +65,7 @@ func MakeKvServer(nodeName string, shardMap *ShardMap, clientPool ClientPool) *K
 		server.stripes[i] = make(map[string]kvEntry)
 	}
 
+	go server.cleanupExpiredEntries()
 	go server.shardMapListenLoop()
 	server.handleShardMapUpdate()
 	return &server
@@ -72,6 +73,7 @@ func MakeKvServer(nodeName string, shardMap *ShardMap, clientPool ClientPool) *K
 
 func (server *KvServerImpl) Shutdown() {
 	server.shutdown <- struct{}{}
+	close(server.shutdown)
 	server.listener.Close()
 }
 
@@ -193,6 +195,29 @@ func (server *KvServerImpl) GetShardContents(
 	request *proto.GetShardContentsRequest,
 ) (*proto.GetShardContentsResponse, error) {
 	panic("TODO: Part C")
+}
+
+func (server *KvServerImpl) cleanupExpiredEntries() {
+	ticker := time.NewTicker(5 * time.Second) // Run cleanup every 5 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-server.shutdown:
+			return // Exit when shutdown is triggered
+		case <-ticker.C:
+			now := time.Now()
+			for stripeIndex := 0; stripeIndex < numStripes; stripeIndex++ {
+				server.locks[stripeIndex].Lock()
+				for key, entry := range server.stripes[stripeIndex] {
+					if now.After(entry.expiry) {
+						delete(server.stripes[stripeIndex], key)
+					}
+				}
+				server.locks[stripeIndex].Unlock()
+			}
+		}
+	}
 }
 
 func contains(nodes []string, nodeName string) bool {
