@@ -53,25 +53,39 @@ func (kv *Kv) Get(ctx context.Context, key string) (string, bool, error) {
 		return "", false, status.Errorf(codes.NotFound, "no nodes host the shard for key %s", key)
 	}
 
-	// Random load balancing: pick a random node to send the request to.
-	// Given enough requests and a sufficiently good randomization,
-	// this spreads the load among the nodes fairly.
-	node := nodeNames[rand.Intn(len(nodeNames))]
+	// failover `Get()` calls that fail to another node
+	attemptedNodes := make(map[string]struct{})
+	var client pb.KvClient
+	var resp *pb.GetResponse
+	var err error
+	for len(attemptedNodes) < len(nodeNames) {
+		// Random load balancing: pick a random node to send the request to.
+		// Given enough requests and a sufficiently good randomization,
+		// this spreads the load among the nodes fairly.
+		node := nodeNames[rand.Intn(len(nodeNames))]
 
-	// use the provided `ClientPool.GetClient` to get a `KvClient` to use to send the request
-	client, err := kv.clientPool.GetClient(node)
-	if err != nil {
-		return "", false, err
+		// Do not try the same node twice for the same call to Get.
+		if _, ok := attemptedNodes[node]; ok {
+			continue
+		}
+		attemptedNodes[node] = struct{}{}
+
+		// If `ClientPool.GetClient()` fails or `KvClient.Get()` fails for a single node, try another node.
+		client, err = kv.clientPool.GetClient(node)
+		if err != nil {
+			continue
+		}
+		resp, err = client.Get(ctx, &pb.GetRequest{Key: key})
+		if err != nil {
+			continue
+		}
+
+		// Return the first successful response from any node in the set.
+		return resp.GetValue(), resp.GetWasFound(), nil
 	}
 
-	// create a `GetRequest` and send it with `KvClient.Get`
-	resp, err := client.Get(ctx, &pb.GetRequest{Key: key})
-	if err != nil {
-		return resp.GetValue(), resp.GetWasFound(), err
-	}
-
-	// If a request to a node is successful, return `(Value, WasFound, nil)`
-	return resp.GetValue(), resp.GetWasFound(), nil
+	// If no node returns a successful response, return the last error heard from any node.
+	return resp.GetValue(), resp.GetWasFound(), err
 }
 
 func (kv *Kv) Set(ctx context.Context, key string, value string, ttl time.Duration) error {
