@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"math/rand"
+	"sync"
 	"time"
 
 	pb "cs426.yale.edu/lab4/kv/proto"
@@ -83,7 +84,36 @@ func (kv *Kv) Set(ctx context.Context, key string, value string, ttl time.Durati
 		logrus.Fields{"key": key},
 	).Trace("client sending Set() request")
 
-	panic("TODO: Part B")
+	// find the nodes which host the key in the request
+	nodeNames := GetNodesForKey(key, kv.shardMap)
+
+	// If no nodes are available (none host the shard), return an error.
+	if len(nodeNames) == 0 {
+		return status.Errorf(codes.NotFound, "no nodes host the shard for key %s", key)
+	}
+
+	// fan out to all nodes which host the shard
+	var wg sync.WaitGroup
+	var err error
+	for _, nodeName := range nodeNames {
+		wg.Add(1)
+		go func(node string) {
+			defer wg.Done()
+
+			client, getClientErr := kv.clientPool.GetClient(node)
+			if getClientErr != nil {
+				err = getClientErr
+				return
+			}
+			_, setErr := client.Set(ctx, &pb.SetRequest{Key: key, Value: value, TtlMs: ttl.Milliseconds()})
+			if setErr != nil {
+				err = setErr
+				return
+			}
+		}(nodeName)
+	}
+	wg.Wait()
+	return err
 }
 
 func (kv *Kv) Delete(ctx context.Context, key string) error {

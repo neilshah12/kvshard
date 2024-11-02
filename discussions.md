@@ -9,3 +9,9 @@ Similarly, if a node has more shards assigned to it, it may already be handling 
 Trying every node until one succeeds might increase the burden on the system, especially if a given shard has many nodes. This might reduce response times for requests that would otherwise succeed on the first try. For instance, if a node is already overloaded and receives a request as a result of the retry mechanism, and then receives another "new" request from a client, it will prioritize the retry request over the new request. The new request will wait in a queue until the retry request is processed, which will increase the response time for the new request. To address this issue, you could implement a more sophisticated load balancing strategy that takes into account the load on each node and assigns requests to nodes accordingly. 
 
 Or, you could implement a priority queue (with a timeout for retries) to ensure that new requests are prioritized over retry attempts. 
+
+# B4
+
+Partial failures on Set calls can lead to inconsistent state across nodes, leading to future calls to `Get(key)` potentially returning no value when a value for `key` might exist on some node in the shard. Similarly, future calls to `Get(key)` might return a stale value, if the most recent `Set(key)` was not propagated to all nodes in the shard. 
+
+In addition, if a `Set(key)` call fails on all nodes, the client might observe that the value for `key` is not set, even though the client attempted to set it. This could lead to data loss or inconsistency in the system. 
