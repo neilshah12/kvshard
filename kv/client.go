@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"math/rand"
 	"time"
 
 	pb "cs426.yale.edu/lab4/kv/proto"
@@ -52,15 +53,19 @@ func (kv *Kv) Get(ctx context.Context, key string) (string, bool, error) {
 		return "", false, status.Errorf(codes.NotFound, "no nodes host the shard for key %s", key)
 	}
 
-	// pick any node name which hosts the shard and
-	// use the provided `ClientPool.GetClient` to get a `KvClient` to use to send the request.
-	client, err := kv.clientPool.GetClient(nodeNames[0])
+	// Random load balancing: pick a random node to send the request to.
+	// Given enough requests and a sufficiently good randomization,
+	// this spreads the load among the nodes fairly.
+	node := nodeNames[rand.Intn(len(nodeNames))]
+
+	// use the provided `ClientPool.GetClient` to get a `KvClient` to use to send the request
+	client, err := kv.clientPool.GetClient(node)
 	if err != nil {
 		return "", false, err
 	}
 
 	// create a `GetRequest` and send it with `KvClient.Get`
-	resp, err := client.Get(context.TODO(), &pb.GetRequest{Key: key})
+	resp, err := client.Get(ctx, &pb.GetRequest{Key: key})
 	if err != nil {
 		return resp.GetValue(), resp.GetWasFound(), err
 	}
