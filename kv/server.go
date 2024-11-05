@@ -2,7 +2,6 @@ package kv
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -56,8 +55,6 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 			shardsToRemove[shardID] = struct{}{}
 		}
 	}
-
-	fmt.Printf("Node %v: currentShards: %v trackedShards: %v shardsToAdd: %v, shardsToRemove: %v\n", server.nodeName, currentShards, server.trackedShards, shardsToAdd, shardsToRemove)
 
 	// Process shard additions
 	for shardID := range shardsToAdd {
@@ -158,7 +155,7 @@ func (server *KvServerImpl) Get(ctx context.Context, request *proto.GetRequest) 
 	}
 
 	// Determine the shard for this key
-	shardID := GetShardForKey(request.GetKey(), len(server.shardData)) - 1
+	shardID := GetShardForKey(request.GetKey(), server.shardMap.NumShards())
 
 	// Lock the specific shard for reading
 	server.shardLocks[shardID].RLock()
@@ -202,7 +199,7 @@ func (server *KvServerImpl) Set(ctx context.Context, request *proto.SetRequest) 
 	expiry := time.Now().Add(time.Duration(request.GetTtlMs()) * time.Millisecond)
 
 	// Determine the shard for this key
-	shardID := GetShardForKey(request.GetKey(), len(server.shardData)) - 1
+	shardID := GetShardForKey(request.GetKey(), server.shardMap.NumShards())
 
 	// Lock the specific shard for writing
 	server.shardLocks[shardID].Lock()
