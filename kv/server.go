@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -58,33 +59,100 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 
 	// Process shard additions
 	for shardID := range shardsToAdd {
-		// Initialize data structure and lock if not already done
-		if server.shardData[shardID] == nil {
+		// Clear `shardData` if it exists or initialize it if not
+		if _, ok := server.shardData[shardID]; ok {
+			clear(server.shardData[shardID])
+		} else {
 			server.shardData[shardID] = make(map[string]kvEntry)
 		}
-		if server.shardLocks[shardID] == nil {
+		// Initialize the lock for the shard if it does not exist
+		if _, ok := server.shardLocks[shardID]; !ok {
 			server.shardLocks[shardID] = &sync.RWMutex{}
 		}
 		server.trackedShards[shardID] = struct{}{} // Mark the shard as tracked
 
-		// Placeholder for shard data copy (to be implemented in Part C3)
+		// use the `GetShardContents` RPC to copy data in any case that a shard is added to a node
+
+		server.shardLocks[shardID].Lock()
+
+		nodeNames := server.shardMap.NodesForShard(shardID)
+
+		// If there are no peers available for a given shard,
+		// log an error and initialize the shard as empty.
+		if len(nodeNames) == 0 {
+			logrus.WithField("node", server.nodeName).Errorf("handleShardMapUpdate(): no peers available for shard %v", shardID)
+			continue
+		} else if len(nodeNames) == 1 && nodeNames[0] == server.nodeName {
+			logrus.WithField("node", server.nodeName).Errorf("handleShardMapUpdate(): no other peers available for shard %v", shardID)
+			continue
+		}
+
+		attemptedNodes := map[string]struct{}{}
+		attemptedNodes[server.nodeName] = struct{}{} // Be sure not to try to call GetShardContents on the current node
+
+		var client proto.KvClient
+		var resp *proto.GetShardContentsResponse
+		var err error
+		for len(attemptedNodes) < len(nodeNames) {
+			// If possible, spread your GetShardContents requests out using some load balancing strategy
+			// Random load balancing: pick a random node to send the request to.
+			// Given enough requests and a sufficiently good randomization,
+			// this spreads the load among the nodes fairly.
+			node := nodeNames[rand.Intn(len(nodeNames))]
+
+			// Do not try the same node twice
+			if _, ok := attemptedNodes[node]; ok {
+				continue
+			}
+			attemptedNodes[node] = struct{}{}
+
+			// Use the provided ClientPool and GetClient to get a KvClient to a peer node.
+			client, err = server.clientPool.GetClient(node)
+			// If a `GetClient` fails for a given node, try another.
+			if err != nil {
+				continue
+			}
+
+			resp, err = client.GetShardContents(context.Background(), &proto.GetShardContentsRequest{Shard: int32(shardID)})
+			// If a `GetShardContents` request fails, try another.
+			if err != nil {
+				continue
+			}
+
+			for _, value := range resp.GetValues() {
+				server.shardData[shardID][value.Key] = kvEntry{
+					value:  value.Value,
+					expiry: time.Now().Add(time.Duration(value.TtlMsRemaining) * time.Millisecond),
+				}
+			}
+			break
+		}
+
+		// If all peers fail, log an error and initialize the shard as empty.
+		if len(attemptedNodes) == len(nodeNames) {
+			logrus.WithField("node", server.nodeName).Errorf("handleShardMapUpdate(): no nodes returned a successful response for shard %v; tried %v (error: %v)", shardID, attemptedNodes, err)
+		}
+
+		server.shardLocks[shardID].Unlock()
 	}
 
 	// Process shard removals
 	for shardID := range shardsToRemove {
 		// Lock the shard to ensure no one else is accessing it during removal
-		server.shardLocks[shardID].Lock()
+		lock := server.shardLocks[shardID]
+		lock.Lock()
 
-		// Clear data for the shard but keep the map entry
-		for key := range server.shardData[shardID] {
-			delete(server.shardData[shardID], key)
-		}
+		// Clear the shard data
+		delete(server.shardData, shardID)
 
 		// Mark the shard as untracked
 		delete(server.trackedShards, shardID)
 
+		// Remove the lock
+		delete(server.shardLocks, shardID)
+
 		// Unlock the shard
-		server.shardLocks[shardID].Unlock()
+		lock.Unlock()
 	}
 
 }
@@ -233,7 +301,8 @@ func (server *KvServerImpl) Delete(ctx context.Context, request *proto.DeleteReq
 		return nil, status.Error(codes.NotFound, "Server does not host shard for this key")
 	}
 
-	shardID := GetShardForKey(request.GetKey(), len(server.shardData)) - 1
+	// Determine the shard for this key
+	shardID := GetShardForKey(request.GetKey(), server.shardMap.NumShards())
 
 	// Lock the specific shard for writing
 	server.shardLocks[shardID].Lock()
@@ -264,7 +333,7 @@ func (server *KvServerImpl) GetShardContents(
 	// GetShardContents should return the subset of keys along with their
 	// values and remaining time on their expiry for a given shard.
 	contents := make([]*proto.GetShardValue, 0)
-	for shardIndex := range len(server.trackedShards) {
+	for shardIndex := range server.shardLocks {
 		server.shardLocks[shardIndex].RLock()
 		for key, entry := range server.shardData[shardIndex] {
 			// All values for only the requested shard should be sent via `GetShardContents`
@@ -295,7 +364,7 @@ func (server *KvServerImpl) cleanupExpiredEntries() {
 			return // Exit when shutdown is triggered
 		case <-ticker.C:
 			now := time.Now()
-			for shardID := 0; shardID < len(server.shardData); shardID++ {
+			for shardID := range server.shardLocks {
 				server.shardLocks[shardID].Lock()
 				for key, entry := range server.shardData[shardID] {
 					if now.After(entry.expiry) {
