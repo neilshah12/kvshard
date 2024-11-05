@@ -81,9 +81,11 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 		// log an error and initialize the shard as empty.
 		if len(nodeNames) == 0 {
 			logrus.WithField("node", server.nodeName).Errorf("handleShardMapUpdate(): no peers available for shard %v", shardID)
+			server.shardLocks[shardID].Unlock()
 			continue
 		} else if len(nodeNames) == 1 && nodeNames[0] == server.nodeName {
 			logrus.WithField("node", server.nodeName).Errorf("handleShardMapUpdate(): no other peers available for shard %v", shardID)
+			server.shardLocks[shardID].Unlock()
 			continue
 		}
 
