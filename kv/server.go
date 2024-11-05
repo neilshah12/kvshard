@@ -28,8 +28,10 @@ type KvServerImpl struct {
 	clientPool ClientPool
 	shutdown   chan struct{}
 
-	stripes []map[string]kvEntry // Data is partitioned across multiple maps
-	locks   []sync.RWMutex       // Each shard has its own RWMutex
+	shardData  map[int]map[string]kvEntry // Data partitioned by shards
+	shardLocks map[int]*sync.RWMutex      // Each shard has its own RWMutex
+
+	trackedShards map[int]bool // Tracks which shards this server currently owns
 }
 
 func (server *KvServerImpl) handleShardMapUpdate() {
@@ -51,18 +53,21 @@ func (server *KvServerImpl) shardMapListenLoop() {
 func MakeKvServer(nodeName string, shardMap *ShardMap, clientPool ClientPool) *KvServerImpl {
 	listener := shardMap.MakeListener()
 	server := KvServerImpl{
-		nodeName:   nodeName,
-		shardMap:   shardMap,
-		listener:   &listener,
-		clientPool: clientPool,
-		shutdown:   make(chan struct{}),
-		stripes:    make([]map[string]kvEntry, numStripes),
-		locks:      make([]sync.RWMutex, numStripes),
+		nodeName:      nodeName,
+		shardMap:      shardMap,
+		listener:      &listener,
+		clientPool:    clientPool,
+		shutdown:      make(chan struct{}),
+		shardData:     make(map[int]map[string]kvEntry),
+		shardLocks:    make(map[int]*sync.RWMutex),
+		trackedShards: make(map[int]bool),
 	}
 
-	// Initialize each shard as an empty map
-	for i := 0; i < numStripes; i++ {
-		server.stripes[i] = make(map[string]kvEntry)
+	// Initialize each shard as an empty map and its corresponding lock
+	for shardID := range shardMap.ShardsForNode(nodeName) {
+		server.shardData[shardID] = make(map[string]kvEntry)
+		server.shardLocks[shardID] = &sync.RWMutex{}
+		server.trackedShards[shardID] = true
 	}
 
 	go server.cleanupExpiredEntries()
@@ -99,14 +104,14 @@ func (server *KvServerImpl) Get(ctx context.Context, request *proto.GetRequest) 
 	}
 
 	// Determine the shard for this key
-	stripeIndex := GetShardForKey(request.GetKey(), numStripes) - 1
+	shardID := GetShardForKey(request.GetKey(), len(server.shardData)) - 1
 
 	// Lock the specific shard for reading
-	server.locks[stripeIndex].RLock()
-	defer server.locks[stripeIndex].RUnlock()
+	server.shardLocks[shardID].RLock()
+	defer server.shardLocks[shardID].RUnlock()
 
 	// Look up the entry in the correct shard
-	entry, found := server.stripes[stripeIndex][request.GetKey()]
+	entry, found := server.shardData[shardID][request.GetKey()]
 	if !found || time.Now().After(entry.expiry) {
 		// Either key does not exist or is expired
 		return &proto.GetResponse{
@@ -143,14 +148,14 @@ func (server *KvServerImpl) Set(ctx context.Context, request *proto.SetRequest) 
 	expiry := time.Now().Add(time.Duration(request.GetTtlMs()) * time.Millisecond)
 
 	// Determine the shard for this key
-	stripeIndex := GetShardForKey(request.GetKey(), numStripes) - 1
+	shardID := GetShardForKey(request.GetKey(), len(server.shardData)) - 1
 
 	// Lock the specific shard for writing
-	server.locks[stripeIndex].Lock()
-	defer server.locks[stripeIndex].Unlock()
+	server.shardLocks[shardID].Lock()
+	defer server.shardLocks[shardID].Unlock()
 
 	// Set the key-value pair in the correct shard
-	server.stripes[stripeIndex][request.GetKey()] = kvEntry{
+	server.shardData[shardID][request.GetKey()] = kvEntry{
 		value:  request.Value,
 		expiry: expiry,
 	}
@@ -177,14 +182,14 @@ func (server *KvServerImpl) Delete(ctx context.Context, request *proto.DeleteReq
 		return nil, status.Error(codes.NotFound, "Server does not host shard for this key")
 	}
 
-	stripeIndex := GetShardForKey(request.GetKey(), numStripes) - 1
+	shardID := GetShardForKey(request.GetKey(), len(server.shardData)) - 1
 
 	// Lock the specific shard for writing
-	server.locks[stripeIndex].Lock()
-	defer server.locks[stripeIndex].Unlock()
+	server.shardLocks[shardID].Lock()
+	defer server.shardLocks[shardID].Unlock()
 
 	// Delete the entry from the correct shard
-	delete(server.stripes[stripeIndex], request.GetKey())
+	delete(server.shardData[shardID], request.GetKey())
 
 	// Return an empty DeleteResponse on success
 	return &proto.DeleteResponse{}, nil
@@ -207,14 +212,14 @@ func (server *KvServerImpl) cleanupExpiredEntries() {
 			return // Exit when shutdown is triggered
 		case <-ticker.C:
 			now := time.Now()
-			for stripeIndex := 0; stripeIndex < numStripes; stripeIndex++ {
-				server.locks[stripeIndex].Lock()
-				for key, entry := range server.stripes[stripeIndex] {
+			for shardID := 0; shardID < len(server.shardData); shardID++ {
+				server.shardLocks[shardID].Lock()
+				for key, entry := range server.shardData[shardID] {
 					if now.After(entry.expiry) {
-						delete(server.stripes[stripeIndex], key)
+						delete(server.shardData[shardID], key)
 					}
 				}
-				server.locks[stripeIndex].Unlock()
+				server.shardLocks[shardID].Unlock()
 			}
 		}
 	}
