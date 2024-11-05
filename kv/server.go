@@ -17,8 +17,6 @@ type kvEntry struct {
 	expiry time.Time // Expiry timestamp based on TTL
 }
 
-const numStripes = 16 // Define a reasonable number of stripes (16 is a typical choice)
-
 type KvServerImpl struct {
 	proto.UnimplementedKvServer
 	nodeName string
@@ -199,7 +197,39 @@ func (server *KvServerImpl) GetShardContents(
 	ctx context.Context,
 	request *proto.GetShardContentsRequest,
 ) (*proto.GetShardContentsResponse, error) {
-	panic("TODO: Part C")
+	logrus.WithFields(
+		logrus.Fields{"node": server.nodeName, "shard": request.Shard},
+	).Trace("node received GetShardContents() request")
+
+	// `GetShardContents` should fail if the server does not host the shard
+	shard := int(request.GetShard())
+	nodeNames := server.shardMap.NodesForShard(shard)
+	if nodeNames == nil || !contains(nodeNames, server.nodeName) {
+		return nil, status.Errorf(codes.NotFound, "Server %v does not host shard %v", server.nodeName, shard)
+	}
+
+	// GetShardContents should return the subset of keys along with their
+	// values and remaining time on their expiry for a given shard.
+	contents := make([]*proto.GetShardValue, 0)
+	for shardIndex := range len(server.trackedShards) {
+		server.shardLocks[shardIndex].RLock()
+		for key, entry := range server.shardData[shardIndex] {
+			// All values for only the requested shard should be sent via `GetShardContents`
+			if GetShardForKey(key, server.shardMap.NumShards()) == shard {
+				// `TtlMsRemaining` should be the time remaining between now and
+				// the expiry time, not the original value of the TTL. This
+				// ensures that the key does not live significantly longer when
+				// it is copied to another node.
+				contents = append(contents, &proto.GetShardValue{
+					Key:            key,
+					Value:          entry.value,
+					TtlMsRemaining: time.Until(entry.expiry).Milliseconds(),
+				})
+			}
+		}
+		server.shardLocks[shardIndex].RUnlock()
+	}
+	return &proto.GetShardContentsResponse{Values: contents}, nil
 }
 
 func (server *KvServerImpl) cleanupExpiredEntries() {
