@@ -184,13 +184,6 @@ func MakeKvServer(nodeName string, shardMap *ShardMap, clientPool ClientPool) *K
 		trackedShards: make(map[int]struct{}),
 	}
 
-	// Initialize each shard as an empty map and its corresponding lock
-	for _, shardID := range shardMap.ShardsForNode(nodeName) {
-		server.shardData[shardID] = make(map[string]kvEntry)
-		server.shardLocks[shardID] = &sync.RWMutex{}
-		server.trackedShards[shardID] = struct{}{}
-	}
-
 	go server.cleanupExpiredEntries()
 	go server.shardMapListenLoop()
 	server.handleShardMapUpdate()
@@ -201,6 +194,10 @@ func (server *KvServerImpl) Shutdown() {
 	server.shutdown <- struct{}{}
 	close(server.shutdown)
 	server.listener.Close()
+
+	clear(server.shardData)
+	clear(server.shardLocks)
+	clear(server.trackedShards)
 }
 
 func (server *KvServerImpl) Get(ctx context.Context, request *proto.GetRequest) (*proto.GetResponse, error) {
