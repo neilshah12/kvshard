@@ -28,7 +28,7 @@ type KvServerImpl struct {
 	shutdown   chan struct{}
 
 	shardData  map[int]map[string]kvEntry // Data partitioned by shards
-	shardLocks map[int]*sync.RWMutex      // Each shard has its own RWMutex
+	shardLocks map[int]*sync.RWMutex      // Each shard has its own RWMutex; protects shardData
 
 	trackedShards map[int]struct{} // Tracks which shards this server currently owns
 }
@@ -59,21 +59,21 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 
 	// Process shard additions
 	for shardID := range shardsToAdd {
+		// Initialize the lock for the shard if it does not exist
+		if _, ok := server.shardLocks[shardID]; !ok {
+			server.shardLocks[shardID] = &sync.RWMutex{}
+		}
+		server.shardLocks[shardID].Lock()
+
 		// Clear `shardData` if it exists or initialize it if not
 		if _, ok := server.shardData[shardID]; ok {
 			clear(server.shardData[shardID])
 		} else {
 			server.shardData[shardID] = make(map[string]kvEntry)
 		}
-		// Initialize the lock for the shard if it does not exist
-		if _, ok := server.shardLocks[shardID]; !ok {
-			server.shardLocks[shardID] = &sync.RWMutex{}
-		}
 		server.trackedShards[shardID] = struct{}{} // Mark the shard as tracked
 
 		// use the `GetShardContents` RPC to copy data in any case that a shard is added to a node
-
-		server.shardLocks[shardID].Lock()
 
 		nodeNames := server.shardMap.NodesForShard(shardID)
 
@@ -95,6 +95,7 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 		var client proto.KvClient
 		var resp *proto.GetShardContentsResponse
 		var err error
+		success := false
 		for len(attemptedNodes) < len(nodeNames) {
 			// If possible, spread your GetShardContents requests out using some load balancing strategy
 			// Random load balancing: pick a random node to send the request to.
@@ -127,11 +128,12 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 					expiry: time.Now().Add(time.Duration(value.TtlMsRemaining) * time.Millisecond),
 				}
 			}
+			success = true
 			break
 		}
 
 		// If all peers fail, log an error and initialize the shard as empty.
-		if len(attemptedNodes) == len(nodeNames) {
+		if !success {
 			logrus.WithField("node", server.nodeName).Errorf("handleShardMapUpdate(): no nodes returned a successful response for shard %v; tried %v (error: %v)", shardID, attemptedNodes, err)
 		}
 
@@ -332,23 +334,21 @@ func (server *KvServerImpl) GetShardContents(
 	// GetShardContents should return the subset of keys along with their
 	// values and remaining time on their expiry for a given shard.
 	contents := make([]*proto.GetShardValue, 0)
-	for shardIndex := range server.shardLocks {
-		server.shardLocks[shardIndex].RLock()
-		for key, entry := range server.shardData[shardIndex] {
-			// All values for only the requested shard should be sent via `GetShardContents`
-			if GetShardForKey(key, server.shardMap.NumShards()) == shard {
-				// `TtlMsRemaining` should be the time remaining between now and
-				// the expiry time, not the original value of the TTL. This
-				// ensures that the key does not live significantly longer when
-				// it is copied to another node.
-				contents = append(contents, &proto.GetShardValue{
-					Key:            key,
-					Value:          entry.value,
-					TtlMsRemaining: time.Until(entry.expiry).Milliseconds(),
-				})
-			}
+	server.shardLocks[shard].RLock()
+	defer server.shardLocks[shard].RUnlock()
+	for key, entry := range server.shardData[shard] {
+		// All values for only the requested shard should be sent via `GetShardContents`
+		if GetShardForKey(key, server.shardMap.NumShards()) == shard {
+			// `TtlMsRemaining` should be the time remaining between now and
+			// the expiry time, not the original value of the TTL. This
+			// ensures that the key does not live significantly longer when
+			// it is copied to another node.
+			contents = append(contents, &proto.GetShardValue{
+				Key:            key,
+				Value:          entry.value,
+				TtlMsRemaining: time.Until(entry.expiry).Milliseconds(),
+			})
 		}
-		server.shardLocks[shardIndex].RUnlock()
 	}
 	return &proto.GetShardContentsResponse{Values: contents}, nil
 }
