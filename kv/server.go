@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -29,42 +30,37 @@ type KvServerImpl struct {
 	shardData  map[int]map[string]kvEntry // Data partitioned by shards
 	shardLocks map[int]*sync.RWMutex      // Each shard has its own RWMutex
 
-	trackedShards map[int]bool // Tracks which shards this server currently owns
+	trackedShards map[int]struct{} // Tracks which shards this server currently owns
 }
 
 func (server *KvServerImpl) handleShardMapUpdate() {
-	currentShards := server.shardMap.ShardsForNode(server.nodeName)
-
-	// Identify shards to add and remove
-	shardsToAdd := []int{}
-	shardsToRemove := []int{}
-
-	// Helper function to check if a shard exists in a slice of shards
-	containsShard := func(shards []int, shardID int) bool {
-		for _, id := range shards {
-			if id == shardID {
-				return true
-			}
-		}
-		return false
+	currentShards := make(map[int]struct{})
+	for _, shardID := range server.shardMap.ShardsForNode(server.nodeName) {
+		currentShards[shardID] = struct{}{}
 	}
 
-	// Determine shards to add
-	for _, shardID := range currentShards {
-		if !server.trackedShards[shardID] {
-			shardsToAdd = append(shardsToAdd, shardID)
+	// Identify shards to add and remove
+	shardsToAdd := map[int]struct{}{}
+	shardsToRemove := map[int]struct{}{}
+
+	// Find shards that are in currentShards but not in trackedShards -> these are shards to add
+	for shardID := range currentShards {
+		if _, ok := server.trackedShards[shardID]; !ok {
+			shardsToAdd[shardID] = struct{}{}
 		}
 	}
 
 	// Find shards that are in trackedShards but not in currentShards -> these are shards to remove
 	for shardID := range server.trackedShards {
-		if !containsShard(currentShards, shardID) {
-			shardsToRemove = append(shardsToRemove, shardID)
+		if _, ok := currentShards[shardID]; !ok {
+			shardsToRemove[shardID] = struct{}{}
 		}
 	}
 
+	fmt.Printf("Node %v: currentShards: %v trackedShards: %v shardsToAdd: %v, shardsToRemove: %v\n", server.nodeName, currentShards, server.trackedShards, shardsToAdd, shardsToRemove)
+
 	// Process shard additions
-	for _, shardID := range shardsToAdd {
+	for shardID := range shardsToAdd {
 		// Initialize data structure and lock if not already done
 		if server.shardData[shardID] == nil {
 			server.shardData[shardID] = make(map[string]kvEntry)
@@ -72,13 +68,13 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 		if server.shardLocks[shardID] == nil {
 			server.shardLocks[shardID] = &sync.RWMutex{}
 		}
-		server.trackedShards[shardID] = true // Mark the shard as tracked
+		server.trackedShards[shardID] = struct{}{} // Mark the shard as tracked
 
 		// Placeholder for shard data copy (to be implemented in Part C3)
 	}
 
 	// Process shard removals
-	for _, shardID := range shardsToRemove {
+	for shardID := range shardsToRemove {
 		// Lock the shard to ensure no one else is accessing it during removal
 		server.shardLocks[shardID].Lock()
 
@@ -88,7 +84,7 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 		}
 
 		// Mark the shard as untracked
-		server.trackedShards[shardID] = false
+		delete(server.trackedShards, shardID)
 
 		// Unlock the shard
 		server.shardLocks[shardID].Unlock()
@@ -118,14 +114,14 @@ func MakeKvServer(nodeName string, shardMap *ShardMap, clientPool ClientPool) *K
 		shutdown:      make(chan struct{}),
 		shardData:     make(map[int]map[string]kvEntry),
 		shardLocks:    make(map[int]*sync.RWMutex),
-		trackedShards: make(map[int]bool),
+		trackedShards: make(map[int]struct{}),
 	}
 
 	// Initialize each shard as an empty map and its corresponding lock
-	for shardID := range shardMap.ShardsForNode(nodeName) {
+	for _, shardID := range shardMap.ShardsForNode(nodeName) {
 		server.shardData[shardID] = make(map[string]kvEntry)
 		server.shardLocks[shardID] = &sync.RWMutex{}
-		server.trackedShards[shardID] = true
+		server.trackedShards[shardID] = struct{}{}
 	}
 
 	go server.cleanupExpiredEntries()
