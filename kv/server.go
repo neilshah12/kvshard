@@ -29,29 +29,25 @@ type KvServerImpl struct {
 
 	shardData  map[int]map[string]kvEntry // Data partitioned by shards
 	shardLocks map[int]*sync.RWMutex      // Each shard has its own RWMutex; protects shardData
-
-	trackedShards map[int]struct{} // Tracks which shards this server currently owns
 }
 
 func (server *KvServerImpl) handleShardMapUpdate() {
-	currentShards := make(map[int]struct{})
+	currentShards := map[int]struct{}{}
 	for _, shardID := range server.shardMap.ShardsForNode(server.nodeName) {
 		currentShards[shardID] = struct{}{}
 	}
 
-	// Identify shards to add and remove
+	// Find shards that are in currentShards but not in shardData -> these are shards to add
 	shardsToAdd := map[int]struct{}{}
-	shardsToRemove := map[int]struct{}{}
-
-	// Find shards that are in currentShards but not in trackedShards -> these are shards to add
 	for shardID := range currentShards {
-		if _, ok := server.trackedShards[shardID]; !ok {
+		if _, ok := server.shardData[shardID]; !ok {
 			shardsToAdd[shardID] = struct{}{}
 		}
 	}
 
-	// Find shards that are in trackedShards but not in currentShards -> these are shards to remove
-	for shardID := range server.trackedShards {
+	// Find shards that are in shardData but not in currentShards -> these are shards to remove
+	shardsToRemove := map[int]struct{}{}
+	for shardID := range server.shardData {
 		if _, ok := currentShards[shardID]; !ok {
 			shardsToRemove[shardID] = struct{}{}
 		}
@@ -71,7 +67,6 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 		} else {
 			server.shardData[shardID] = make(map[string]kvEntry)
 		}
-		server.trackedShards[shardID] = struct{}{} // Mark the shard as tracked
 
 		// use the `GetShardContents` RPC to copy data in any case that a shard is added to a node
 
@@ -149,9 +144,6 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 		// Clear the shard data
 		delete(server.shardData, shardID)
 
-		// Mark the shard as untracked
-		delete(server.trackedShards, shardID)
-
 		// Remove the lock
 		delete(server.shardLocks, shardID)
 
@@ -176,14 +168,13 @@ func (server *KvServerImpl) shardMapListenLoop() {
 func MakeKvServer(nodeName string, shardMap *ShardMap, clientPool ClientPool) *KvServerImpl {
 	listener := shardMap.MakeListener()
 	server := KvServerImpl{
-		nodeName:      nodeName,
-		shardMap:      shardMap,
-		listener:      &listener,
-		clientPool:    clientPool,
-		shutdown:      make(chan struct{}),
-		shardData:     make(map[int]map[string]kvEntry),
-		shardLocks:    make(map[int]*sync.RWMutex),
-		trackedShards: make(map[int]struct{}),
+		nodeName:   nodeName,
+		shardMap:   shardMap,
+		listener:   &listener,
+		clientPool: clientPool,
+		shutdown:   make(chan struct{}),
+		shardData:  make(map[int]map[string]kvEntry),
+		shardLocks: make(map[int]*sync.RWMutex),
 	}
 
 	go server.cleanupExpiredEntries()
@@ -196,10 +187,6 @@ func (server *KvServerImpl) Shutdown() {
 	server.shutdown <- struct{}{}
 	close(server.shutdown)
 	server.listener.Close()
-
-	clear(server.shardData)
-	clear(server.shardLocks)
-	clear(server.trackedShards)
 }
 
 func (server *KvServerImpl) Get(ctx context.Context, request *proto.GetRequest) (*proto.GetResponse, error) {
@@ -324,31 +311,30 @@ func (server *KvServerImpl) GetShardContents(
 		logrus.Fields{"node": server.nodeName, "shard": request.Shard},
 	).Trace("node received GetShardContents() request")
 
-	// `GetShardContents` should fail if the server does not host the shard
 	shard := int(request.GetShard())
-	nodeNames := server.shardMap.NodesForShard(shard)
-	if nodeNames == nil || !contains(nodeNames, server.nodeName) {
+
+	// `GetShardContents` should fail if the server does not host the shard
+	if lock, ok := server.shardLocks[shard]; !ok {
 		return nil, status.Errorf(codes.NotFound, "Server %v does not host shard %v", server.nodeName, shard)
+	} else {
+		lock.Lock()
+		defer lock.Unlock()
 	}
 
 	// GetShardContents should return the subset of keys along with their
 	// values and remaining time on their expiry for a given shard.
-	contents := make([]*proto.GetShardValue, 0)
-	server.shardLocks[shard].RLock()
-	defer server.shardLocks[shard].RUnlock()
+	contents := []*proto.GetShardValue{}
 	for key, entry := range server.shardData[shard] {
-		// All values for only the requested shard should be sent via `GetShardContents`
-		if GetShardForKey(key, server.shardMap.NumShards()) == shard {
-			// `TtlMsRemaining` should be the time remaining between now and
-			// the expiry time, not the original value of the TTL. This
-			// ensures that the key does not live significantly longer when
-			// it is copied to another node.
-			contents = append(contents, &proto.GetShardValue{
-				Key:            key,
-				Value:          entry.value,
-				TtlMsRemaining: time.Until(entry.expiry).Milliseconds(),
-			})
-		}
+		// All values for only the requested shard should be sent via `GetShardContents`.
+		// `TtlMsRemaining` should be the time remaining between now and
+		// the expiry time, not the original value of the TTL. This
+		// ensures that the key does not live significantly longer when
+		// it is copied to another node.
+		contents = append(contents, &proto.GetShardValue{
+			Key:            key,
+			Value:          entry.value,
+			TtlMsRemaining: time.Until(entry.expiry).Milliseconds(),
+		})
 	}
 	return &proto.GetShardContentsResponse{Values: contents}, nil
 }
