@@ -28,8 +28,8 @@ type KvServerImpl struct {
 	shutdown   chan struct{}
 
 	shardData      map[int]map[string]kvEntry // Data partitioned by shards
-	shardLocks     map[int]*sync.RWMutex      // Each shard has its own RWMutex; protects shardData
-	shardLocksLock sync.RWMutex               // protects shardLocks
+	shardLocks     map[int]*sync.RWMutex      // Each shard has its own RWMutex; shardLocks[shard] protects shardData[shard]
+	shardLocksLock sync.RWMutex               // protects shardData and shardLocks
 }
 
 func (server *KvServerImpl) handleShardMapUpdate() {
@@ -37,6 +37,8 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 	for _, shardID := range server.shardMap.ShardsForNode(server.nodeName) {
 		currentShards[shardID] = struct{}{}
 	}
+
+	server.shardLocksLock.RLock()
 
 	// Find shards that are in currentShards but not in shardData -> these are shards to add
 	shardsToAdd := map[int]struct{}{}
@@ -54,26 +56,25 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 		}
 	}
 
+	server.shardLocksLock.RUnlock()
+
 	// Process shard additions
 	for shardID := range shardsToAdd {
-		// Initialize the lock for the shard if it does not exist
 		server.shardLocksLock.RLock()
-		if _, ok := server.shardLocks[shardID]; !ok {
-			server.shardLocksLock.RUnlock()
-			server.shardLocksLock.Lock()
-			server.shardLocks[shardID] = &sync.RWMutex{}
-			server.shardLocksLock.Unlock()
-		} else {
-			server.shardLocksLock.RUnlock()
-		}
-		server.shardLocks[shardID].Lock()
+		_, isShardTracked := server.shardLocks[shardID]
+		server.shardLocksLock.RUnlock()
 
-		// Clear `shardData` if it exists or initialize it if not
-		if _, ok := server.shardData[shardID]; ok {
+		// If the shard is not already tracked, then create entries in `shardLocks` and `shardData`
+		server.shardLocksLock.Lock()
+		if isShardTracked {
+			server.shardLocks[shardID].Lock()
 			clear(server.shardData[shardID])
+			server.shardLocks[shardID].Unlock()
 		} else {
+			server.shardLocks[shardID] = &sync.RWMutex{}
 			server.shardData[shardID] = make(map[string]kvEntry)
 		}
+		server.shardLocksLock.Unlock()
 
 		// use the `GetShardContents` RPC to copy data in any case that a shard is added to a node
 
@@ -83,11 +84,9 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 		// log an error and initialize the shard as empty.
 		if len(nodeNames) == 0 {
 			logrus.WithField("node", server.nodeName).Errorf("handleShardMapUpdate(): no peers available for shard %v", shardID)
-			server.shardLocks[shardID].Unlock()
 			continue
 		} else if len(nodeNames) == 1 && nodeNames[0] == server.nodeName {
 			logrus.WithField("node", server.nodeName).Errorf("handleShardMapUpdate(): no other peers available for shard %v", shardID)
-			server.shardLocks[shardID].Unlock()
 			continue
 		}
 
@@ -119,17 +118,20 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 			}
 
 			resp, err = client.GetShardContents(context.Background(), &proto.GetShardContentsRequest{Shard: int32(shardID)})
+
 			// If a `GetShardContents` request fails, try another.
 			if err != nil {
 				continue
 			}
 
+			server.shardLocks[shardID].Lock()
 			for _, value := range resp.GetValues() {
 				server.shardData[shardID][value.Key] = kvEntry{
 					value:  value.Value,
 					expiry: time.Now().Add(time.Duration(value.TtlMsRemaining) * time.Millisecond),
 				}
 			}
+			server.shardLocks[shardID].Unlock()
 			success = true
 			break
 		}
@@ -138,12 +140,12 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 		if !success {
 			logrus.WithField("node", server.nodeName).Errorf("handleShardMapUpdate(): no nodes returned a successful response for shard %v; tried %v (error: %v)", shardID, attemptedNodes, err)
 		}
-
-		server.shardLocks[shardID].Unlock()
 	}
 
 	// Process shard removals
 	for shardID := range shardsToRemove {
+		server.shardLocksLock.Lock()
+
 		// Lock the shard to ensure no one else is accessing it during removal
 		lock := server.shardLocks[shardID]
 		lock.Lock()
@@ -156,6 +158,8 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 
 		// Unlock the shard
 		lock.Unlock()
+
+		server.shardLocksLock.Unlock()
 	}
 
 }
@@ -213,12 +217,11 @@ func (server *KvServerImpl) Get(ctx context.Context, request *proto.GetRequest) 
 	// Check if this server hosts the shard
 	shardID := GetShardForKey(request.GetKey(), server.shardMap.NumShards())
 	server.shardLocksLock.RLock()
+	defer server.shardLocksLock.RUnlock()
 	if _, ok := server.shardLocks[shardID]; !ok {
-		server.shardLocksLock.RUnlock()
 		return nil, status.Errorf(codes.NotFound, "Server %v does not host shard %v", server.nodeName, shardID)
 	}
 	lock := server.shardLocks[shardID]
-	server.shardLocksLock.RUnlock()
 	lock.RLock()
 	defer lock.RUnlock()
 
@@ -252,12 +255,11 @@ func (server *KvServerImpl) Set(ctx context.Context, request *proto.SetRequest) 
 	// Check if this server hosts the shard
 	shardID := GetShardForKey(request.GetKey(), server.shardMap.NumShards())
 	server.shardLocksLock.RLock()
+	defer server.shardLocksLock.RUnlock()
 	if _, ok := server.shardLocks[shardID]; !ok {
-		server.shardLocksLock.RUnlock()
 		return nil, status.Errorf(codes.NotFound, "Server %v does not host shard %v", server.nodeName, shardID)
 	}
 	lock := server.shardLocks[shardID]
-	server.shardLocksLock.RUnlock()
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -287,12 +289,11 @@ func (server *KvServerImpl) Delete(ctx context.Context, request *proto.DeleteReq
 	// Check if this server hosts the shard
 	shardID := GetShardForKey(request.GetKey(), server.shardMap.NumShards())
 	server.shardLocksLock.RLock()
+	defer server.shardLocksLock.RUnlock()
 	if _, ok := server.shardLocks[shardID]; !ok {
-		server.shardLocksLock.RUnlock()
 		return nil, status.Errorf(codes.NotFound, "Server %v does not host shard %v", server.nodeName, shardID)
 	}
 	lock := server.shardLocks[shardID]
-	server.shardLocksLock.RUnlock()
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -315,12 +316,11 @@ func (server *KvServerImpl) GetShardContents(
 
 	// `GetShardContents` should fail if the server does not host the shard
 	server.shardLocksLock.RLock()
+	defer server.shardLocksLock.RUnlock()
 	if _, ok := server.shardLocks[shard]; !ok {
-		server.shardLocksLock.RUnlock()
 		return nil, status.Errorf(codes.NotFound, "Server %v does not host shard %v", server.nodeName, shard)
 	}
 	lock := server.shardLocks[shard]
-	server.shardLocksLock.RUnlock()
 	lock.RLock()
 	defer lock.RUnlock()
 
@@ -352,6 +352,7 @@ func (server *KvServerImpl) cleanupExpiredEntries() {
 			return // Exit when shutdown is triggered
 		case <-ticker.C:
 			now := time.Now()
+			server.shardLocksLock.RLock()
 			for shardID := range server.shardLocks {
 				server.shardLocks[shardID].Lock()
 				for key, entry := range server.shardData[shardID] {
@@ -361,15 +362,7 @@ func (server *KvServerImpl) cleanupExpiredEntries() {
 				}
 				server.shardLocks[shardID].Unlock()
 			}
+			server.shardLocksLock.RUnlock()
 		}
 	}
-}
-
-func contains(nodes []string, nodeName string) bool {
-	for _, node := range nodes {
-		if node == nodeName {
-			return true
-		}
-	}
-	return false
 }
