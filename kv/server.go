@@ -27,8 +27,9 @@ type KvServerImpl struct {
 	clientPool ClientPool
 	shutdown   chan struct{}
 
-	shardData  map[int]map[string]kvEntry // Data partitioned by shards
-	shardLocks map[int]*sync.RWMutex      // Each shard has its own RWMutex; protects shardData
+	shardData      map[int]map[string]kvEntry // Data partitioned by shards
+	shardLocks     map[int]*sync.RWMutex      // Each shard has its own RWMutex; protects shardData
+	shardLocksLock sync.RWMutex               // protects shardLocks
 }
 
 func (server *KvServerImpl) handleShardMapUpdate() {
@@ -56,8 +57,14 @@ func (server *KvServerImpl) handleShardMapUpdate() {
 	// Process shard additions
 	for shardID := range shardsToAdd {
 		// Initialize the lock for the shard if it does not exist
+		server.shardLocksLock.RLock()
 		if _, ok := server.shardLocks[shardID]; !ok {
+			server.shardLocksLock.RUnlock()
+			server.shardLocksLock.Lock()
 			server.shardLocks[shardID] = &sync.RWMutex{}
+			server.shardLocksLock.Unlock()
+		} else {
+			server.shardLocksLock.RUnlock()
 		}
 		server.shardLocks[shardID].Lock()
 
@@ -168,13 +175,14 @@ func (server *KvServerImpl) shardMapListenLoop() {
 func MakeKvServer(nodeName string, shardMap *ShardMap, clientPool ClientPool) *KvServerImpl {
 	listener := shardMap.MakeListener()
 	server := KvServerImpl{
-		nodeName:   nodeName,
-		shardMap:   shardMap,
-		listener:   &listener,
-		clientPool: clientPool,
-		shutdown:   make(chan struct{}),
-		shardData:  make(map[int]map[string]kvEntry),
-		shardLocks: make(map[int]*sync.RWMutex),
+		nodeName:       nodeName,
+		shardMap:       shardMap,
+		listener:       &listener,
+		clientPool:     clientPool,
+		shutdown:       make(chan struct{}),
+		shardData:      make(map[int]map[string]kvEntry),
+		shardLocks:     make(map[int]*sync.RWMutex),
+		shardLocksLock: sync.RWMutex{},
 	}
 
 	go server.cleanupExpiredEntries()
@@ -202,20 +210,17 @@ func (server *KvServerImpl) Get(ctx context.Context, request *proto.GetRequest) 
 		return nil, status.Error(codes.InvalidArgument, "Key cannot be empty")
 	}
 
-	// Get the nodes responsible for the key's shard
-	nodes := GetNodesForKey(request.GetKey(), server.shardMap)
-
 	// Check if this server hosts the shard
-	if !contains(nodes, server.nodeName) {
-		return nil, status.Error(codes.NotFound, "Server does not host shard for this key")
-	}
-
-	// Determine the shard for this key
 	shardID := GetShardForKey(request.GetKey(), server.shardMap.NumShards())
-
-	// Lock the specific shard for reading
-	server.shardLocks[shardID].RLock()
-	defer server.shardLocks[shardID].RUnlock()
+	server.shardLocksLock.RLock()
+	if _, ok := server.shardLocks[shardID]; !ok {
+		server.shardLocksLock.RUnlock()
+		return nil, status.Errorf(codes.NotFound, "Server %v does not host shard %v", server.nodeName, shardID)
+	}
+	lock := server.shardLocks[shardID]
+	server.shardLocksLock.RUnlock()
+	lock.RLock()
+	defer lock.RUnlock()
 
 	// Look up the entry in the correct shard
 	entry, found := server.shardData[shardID][request.GetKey()]
@@ -244,22 +249,20 @@ func (server *KvServerImpl) Set(ctx context.Context, request *proto.SetRequest) 
 		return nil, status.Error(codes.InvalidArgument, "Key cannot be empty")
 	}
 
-	// Get the nodes responsible for the key's shard
-	nodes := GetNodesForKey(request.GetKey(), server.shardMap)
-
-	if !contains(nodes, server.nodeName) {
-		return nil, status.Error(codes.NotFound, "Server does not host shard for this key")
+	// Check if this server hosts the shard
+	shardID := GetShardForKey(request.GetKey(), server.shardMap.NumShards())
+	server.shardLocksLock.RLock()
+	if _, ok := server.shardLocks[shardID]; !ok {
+		server.shardLocksLock.RUnlock()
+		return nil, status.Errorf(codes.NotFound, "Server %v does not host shard %v", server.nodeName, shardID)
 	}
+	lock := server.shardLocks[shardID]
+	server.shardLocksLock.RUnlock()
+	lock.Lock()
+	defer lock.Unlock()
 
 	// Calculate the expiry time based on TTL (in milliseconds).
 	expiry := time.Now().Add(time.Duration(request.GetTtlMs()) * time.Millisecond)
-
-	// Determine the shard for this key
-	shardID := GetShardForKey(request.GetKey(), server.shardMap.NumShards())
-
-	// Lock the specific shard for writing
-	server.shardLocks[shardID].Lock()
-	defer server.shardLocks[shardID].Unlock()
 
 	// Set the key-value pair in the correct shard
 	server.shardData[shardID][request.GetKey()] = kvEntry{
@@ -281,20 +284,17 @@ func (server *KvServerImpl) Delete(ctx context.Context, request *proto.DeleteReq
 		return nil, status.Error(codes.InvalidArgument, "Key cannot be empty")
 	}
 
-	// Get the nodes responsible for the key's shard
-	nodes := GetNodesForKey(request.GetKey(), server.shardMap)
-
 	// Check if this server hosts the shard
-	if !contains(nodes, server.nodeName) {
-		return nil, status.Error(codes.NotFound, "Server does not host shard for this key")
-	}
-
-	// Determine the shard for this key
 	shardID := GetShardForKey(request.GetKey(), server.shardMap.NumShards())
-
-	// Lock the specific shard for writing
-	server.shardLocks[shardID].Lock()
-	defer server.shardLocks[shardID].Unlock()
+	server.shardLocksLock.RLock()
+	if _, ok := server.shardLocks[shardID]; !ok {
+		server.shardLocksLock.RUnlock()
+		return nil, status.Errorf(codes.NotFound, "Server %v does not host shard %v", server.nodeName, shardID)
+	}
+	lock := server.shardLocks[shardID]
+	server.shardLocksLock.RUnlock()
+	lock.Lock()
+	defer lock.Unlock()
 
 	// Delete the entry from the correct shard
 	delete(server.shardData[shardID], request.GetKey())
@@ -314,12 +314,15 @@ func (server *KvServerImpl) GetShardContents(
 	shard := int(request.GetShard())
 
 	// `GetShardContents` should fail if the server does not host the shard
-	if lock, ok := server.shardLocks[shard]; !ok {
+	server.shardLocksLock.RLock()
+	if _, ok := server.shardLocks[shard]; !ok {
+		server.shardLocksLock.RUnlock()
 		return nil, status.Errorf(codes.NotFound, "Server %v does not host shard %v", server.nodeName, shard)
-	} else {
-		lock.Lock()
-		defer lock.Unlock()
 	}
+	lock := server.shardLocks[shard]
+	server.shardLocksLock.RUnlock()
+	lock.RLock()
+	defer lock.RUnlock()
 
 	// GetShardContents should return the subset of keys along with their
 	// values and remaining time on their expiry for a given shard.
