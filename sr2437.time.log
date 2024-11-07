@@ -1,0 +1,34 @@
+ESTIMATE of time to complete assignment: 20 hours
+
+       Time     Time
+Date   Started  Spent  Work completed
+-----  -------  -----  --------------
+11/02   1:30pm  0:30   read spec
+11/02   2:00pm  0:30   Implement B1. Get
+11/02   2:30pm  0:15   Implement B2. Load balancing Get calls
+11/02   2:45pm  0:15   Implement B3. Failovers and error handling
+11/02   3:00pm  0:30   Implement B4. sent
+11/04   2:30pm  0:30   Implement C2. Implementing GetShardContents
+11/04   7:00pm  1:30   Debug C1. Using ShardMapListener and handling shard changes
+11/05  11:00am  6:00   Implement C3. Copying shard data
+                -----
+                10:00  TOTAL time spent
+
+I worked with Neil Shah. 
+
+The hardest challenge in this project was implementing concurrency and thread-
+safety. First, we forgot that a node can hold multiple shards. In other words,
+we were treating shards and nodes as a one-to-many relationship, when it is in 
+fact a many-to-many relationship. As such, the suggestion to have one lock per 
+shard in the server implementation confused us, and we implemented this
+incorrectly. 
+
+When fixing this, we did not consider concurrency rigorously enough. In
+particular, we had two maps. One map, `shardData`, was a map from shard ID to a
+key-value mapping of the entries in that shard. The other map, `shardLocks`, was
+a map from shard ID to a lock. We thought that this was sufficient, since
+accesses to the key-value mappings in `shardData` would be protected by the
+corresponding lock in `shardLocks`. However, we learned after implementing this
+that concurrent reads and writes to a map, even if the keys are distinct,
+qualifies as a data race in Go. Therefore, we needed a mutex to protect reads
+and writes on `shardData` and `shardLocks` themselves. 

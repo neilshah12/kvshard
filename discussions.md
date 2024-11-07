@@ -43,3 +43,11 @@ Correct responses: 34279/34279 = 100.000000%
 Total requests: 46611 = 776.695713 QPS
 
 I then tried changing the ttl to 25% of the default of 2s and got only a slight decrease in QPS, which was originally surprising but now makes sense because this just means that my 5 second cleaning goroutine is being more productive, just slightly more productive.
+
+# Group work
+
+nds44 and sr2437 completed Part A and Part B, respectively, in parallel. 
+
+Then, nds44 and sr2437 completed C1 and C2, respectively, in parallel. 
+
+Then, sr2437 completed C3 while nds44 completed Part D. 

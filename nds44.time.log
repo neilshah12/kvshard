@@ -1,0 +1,13 @@
+ESTIMATE of time to complete assignment: 10 hours
+
+      Time     Time
+Date  Started  Spent Work completed
+----  -------  ----  --------------
+11/03   2:00pm  5:00 read the spec and worked on part A, got the tests working
+11/04   2:00pm  5:00 collaborated and debuged part C and D
+
+               10:00  TOTAL time spent
+
+I discussed my solution with: Sumanth Ratna, ChatGPT
+
+This felt like a practical application of distributed systems and it was fairly painless in comparison to Raft. I now have an understanding of how hash maps work in a distributed context. The locks and lock of locks got extremely confusing during debugging. It seemed like there was a race condition on literally every line, but that was because the map was having concurrent read and writes on different keys, which makes sense why we needed the lock of locks at the top level and it ended up fixing everything. We tried tracking the added shards initially but that was not a thread safe way of doing it, we found a better way with the locks.
